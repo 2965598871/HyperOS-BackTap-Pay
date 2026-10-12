@@ -24,16 +24,26 @@ jobs:
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
-        with:
-          cmdline-tools-version: 15859902
 
-      - name: Install Android CLI
-        run: curl -fsSL https://dl.google.com/android/cli/latest/linux_x86_64/install.sh | bash
-
-      - name: Install Android 17 SDK
+      - name: Install Android 17 (API 37) platform
         run: |
-          export PATH="$HOME/.local/bin:$PATH"
-          android --sdk="$ANDROID_SDK_ROOT" sdk install --canary platforms/android-37 build-tools/37.0.0
+          set -e
+          mkdir -p "$ANDROID_SDK_ROOT/platforms"
+          curl -fsSL --retry 3 -o /tmp/platform-37.zip \
+            https://dl.google.com/android/repository/platform-37.0_r02.zip
+          unzip -q -o /tmp/platform-37.zip -d "$ANDROID_SDK_ROOT/platforms"
+          cd "$ANDROID_SDK_ROOT/platforms"
+          if [ ! -d android-37 ]; then
+            SRC=$(ls -d android-37* 2>/dev/null | head -1)
+            [ -n "$SRC" ] && mv "$SRC" android-37
+          fi
+          cat android-37/source.properties
+
+      - name: Install build-tools 37.0.0
+        run: |
+          yes | "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" \
+            --install "build-tools;37.0.0" > /dev/null 2>&1 || true
+          ls "$ANDROID_SDK_ROOT/build-tools"
 
       - name: Set up Gradle 9.5.1
         uses: gradle/actions/setup-gradle@v4
@@ -58,13 +68,14 @@ jobs:
       - name: Collect release APK
         run: |
           mkdir -p out
-          cp app/build/outputs/apk/release/app-release.apk "out/HyperOS-BackTap-Pay-v${{ steps.version.outputs.name }}-release.apk"
+          cp app/build/outputs/apk/release/app-release.apk \
+             "out/BackTapWallet-v${{ steps.version.outputs.name }}-release.apk"
 
       - name: Upload release APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: HyperOS-BackTap-Pay-v${{ steps.version.outputs.name }}-release
-          path: out/HyperOS-BackTap-Pay-v${{ steps.version.outputs.name }}-release.apk
+          name: BackTapWallet-v${{ steps.version.outputs.name }}-release
+          path: out/BackTapWallet-v${{ steps.version.outputs.name }}-release.apk
           if-no-files-found: error
           retention-days: 30
 
@@ -72,6 +83,6 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ steps.version.outputs.name }}
-          name: HyperOS BackTap Pay v${{ steps.version.outputs.name }}
+          name: BackTap Wallet v${{ steps.version.outputs.name }}
           generate_release_notes: true
-          files: out/HyperOS-BackTap-Pay-v${{ steps.version.outputs.name }}-release.apk
+          files: out/BackTapWallet-v${{ steps.version.outputs.name }}-release.apk

@@ -3,15 +3,15 @@ plugins {
 }
 
 android {
-    namespace 'com.mike.hyperosbacktappay'
+    namespace 'com.mike.backtapwallet'
     compileSdk 37
 
     defaultConfig {
-        applicationId 'com.mike.hyperosbacktappay'
+        applicationId 'com.mike.backtapwallet'
         minSdk 30
         targetSdk 35
-        versionCode 16
-        versionName '0.3.9-retrigger-fix'
+        versionCode 11
+        versionName '0.4.7'
     }
 
     buildFeatures {

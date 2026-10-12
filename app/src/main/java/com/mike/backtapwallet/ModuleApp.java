@@ -1,4 +1,4 @@
-package com.mike.hyperosbacktappay;
+package com.mike.backtapwallet;
 
 import android.app.Application;
 
@@ -8,6 +8,7 @@ import io.github.libxposed.service.XposedService;
 import io.github.libxposed.service.XposedServiceHelper;
 
 public final class ModuleApp extends Application implements XposedServiceHelper.OnServiceListener {
+
     private static volatile XposedService service;
     private static final CopyOnWriteArraySet<ServiceStateListener> listeners =
             new CopyOnWriteArraySet<>();
