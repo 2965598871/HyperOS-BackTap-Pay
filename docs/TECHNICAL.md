@@ -216,14 +216,41 @@ Hook ID 约定：
 
 ### 5.3 两条触发路径
 
-| 路径 | 触发点 | 覆盖时序 |
-|---|---|---|
-| A | `KeyguardViewMediator#showKeyguard`（after 阶段） | 投屏在先 → 之后锁屏 |
-| B | `DisplayManager.DisplayListener#onDisplayAdded` | 锁屏在先 → 之后连投屏 |
+| 路径 | 触发点 | 覆盖时序 | 开关 |
+|---|---|---|---|
+| A | `KeyguardViewMediator#showKeyguard`（after 阶段） | 投屏在先 → 之后锁屏 | `mirror_unlock_showkeyguard_enabled`，**默认 false** |
+| B | `DisplayManager.DisplayListener#onDisplayAdded` | 锁屏在先 → 之后连投屏 | 仅受总开关 `mirror_unlock_enabled` 控制 |
 
 路径 A 在 `chain.proceed()` 之后执行，并顺带缓存 `KeyguardViewMediator` 实例供路径 B 使用；触发节流窗口 1 秒，避免锁屏动画期间被反复触发。
 
-路径 B 在显示添加事件的 500 / 1500 / 3000 ms 三个时间点各尝试一次，每次以 `KeyguardManager#isKeyguardLocked()` 为守卫，成功后后续重试自动跳过（幂等）。
+**路径 A 独立闸门（v0.4.8 起）**：`onShowKeyguard` 在缓存实例之后、触发解锁之前检查
+`isShowKeyguardPathEnabled()`。默认关闭——该路径会在投屏中手动锁屏的瞬间把锁解掉（用户感知为
+"锁不上"）。关闭时仅跳过解锁触发，**实例缓存与路径 B 不受影响**。总开关
+`mirror_unlock_enabled` 仍是两路径共同的前置条件（在 `tryUnlock` 中求值）。
+
+路径 B 采用**密集轮询**（v0.4.9 起）：投屏建立后按
+`mirror_unlock_poll_interval`（默认 **150ms**）周期检查 `KeyguardManager#isKeyguardLocked()`，
+一旦检测到已锁屏立即执行解锁。
+
+早期实现使用 0.5 / 1.5 / 3.0 秒三个**固定档位**，命中时机纯靠运气——投屏建立时手机往往尚未锁屏，
+实测最坏要等到第 3 档，白等 3.1 秒。轮询把最坏额外等待从 3.1 秒降到 1 个间隔（150ms）。
+
+三条停止条件，命中任一即**彻底停表**，不再投递后续 tick：
+
+| 停止条件 | 判定 | 说明 |
+|---|---|---|
+| 解锁完成 | `unlockDone` 置位 | `handleKeyguardDone` 成功那一刻置位，原子标志 |
+| 会话超时 | `Poll timeout` | `POLL_TIMEOUT_MS` = 15 秒，投屏建立但始终不锁屏时兜底 |
+| 会话作废 | `generation` 不匹配 | 新一次 `onDisplayAdded` 到来时自增序号，旧会话残留 tick 全部失效 |
+
+**幂等与去重（`unlockDone`）**：`isKeyguardLocked()` 只在解锁**真正收屏之后**才变 false，
+若两条轮询任务并发进入会各自跑一遍完整的 GateKeeper 硬件校验（实测浪费一次 TEE 往返）。
+`unlockDone` 在校验通过、`handleKeyguardDone` 投递前即置位，使并发任务立刻短路。
+若 `handleKeyguardDone` 抛异常则复位，允许后续重试。
+
+**反射预热（v0.4.9 起）**：实测首次解锁 2.16 秒 vs 热态 0.93 秒，差值来自反射类加载与 JIT。
+`prewarmReflection()` 在 hook 就绪时后台解析 `LockscreenCredential` / `LockPatternView$Cell`
+及其关键方法，把该成本从「用户等待解锁的时刻」前移到「模块加载时刻」。失败非致命。
 
 实例获取有两处来源：路径 A 缓存的实例，或从 `SystemUIApplicationImpl.mServices`（`AtomicReference<CoreStartable[]>`）按类名扫描——后者是 Android 15+ 重构后的入口（`com.android.systemui.SystemUIApplication` 已不存在）。
 

@@ -38,6 +38,11 @@ import io.github.libxposed.api.XposedInterface;
  * </ul>
  * 实测妙享连接时 {@code onDisplayAdded} 比 {@code showKeyguard} 晚约 1.2s，两条都必须保留。
  *
+ * <p>路径 B 采用<b>密集轮询</b>而非固定档位：投屏建立时手机往往尚未锁屏，keyguard 何时
+ * 锁上无法预知，早期 0.5s / 1.5s / 3.0s 三档做法最坏要白等 3.1s。现按
+ * {@link Config#PREF_MIRROR_UNLOCK_POLL_INTERVAL}（默认 150ms）轮询，
+ * 命中即解、解完立刻停表（{@link #unlockDone}），并受 {@link #POLL_TIMEOUT_MS} 兜底。
+ *
  * <p>两个必须维持的设计（改代码时勿"简化"）：
  * <ol>
  *   <li>{@code LockPatternUtils.checkCredential} <b>禁止主线程</b>，而
@@ -59,6 +64,14 @@ public final class MirrorAutoUnlockHook {
     /** 解锁成功后的可见回执文案。 */
     private static final String UNLOCK_TOAST_TEXT = "投屏已连接，自动解锁完成";
 
+    /**
+     * 单次轮询会话的最长持续时间。
+     *
+     * <p>守卫作用：投屏建立但用户始终不锁屏时，轮询必须自行停止，不能无限占用。
+     * 超过此时长仍未命中即收工，后续若锁屏会由路径 A 或下一次 {@code onDisplayAdded} 接管。</p>
+     */
+    private static final long POLL_TIMEOUT_MS = 15_000L;
+
     private static volatile XposedInterface xposed;
     private static volatile ClassLoader classLoader;
     private static volatile SharedPreferences preferences;
@@ -66,6 +79,54 @@ public final class MirrorAutoUnlockHook {
     private static volatile boolean hooked;
     private static volatile boolean listenerRegistered;
     private static volatile long lastTriggerAt;
+
+    /** 当前轮询会话的序号；每次新会话自增，用于作废旧会话仍在跑的循环。 */
+    private static volatile int pollGeneration;
+
+    /**
+     * 「本轮投屏已经解锁完成」标志。
+     *
+     * <p>幂等守卫 {@code isKeyguardLocked()} 只在解锁**真正收屏之后**才变 false，
+     * 若两条轮询任务并发进入，会各自跑一遍完整的 GateKeeper 硬件校验（实测浪费一次
+     * TEE 往返）。本标志在 {@code handleKeyguardDone} 成功那一刻置位，后续轮询进入即短路。</p>
+     */
+    private static final java.util.concurrent.atomic.AtomicBoolean unlockDone =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
+    /** 反射类预热是否已完成，避免重复开销。 */
+    private static final java.util.concurrent.atomic.AtomicBoolean prewarmed =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
+
+    /**
+     * 解锁执行互斥锁：保证同一时刻只有一条线程在跑 {@code checkCredential}。
+     *
+     * <p>这是防雪崩的关键护栏。{@code checkCredential} 单次耗时 0.9~2.2 秒，
+     * 任何"每个间隔起一条线程"的写法都会让线程数呈指数累积，足以压死 SystemUI。</p>
+     */
+    private static final java.util.concurrent.atomic.AtomicBoolean unlockRunning =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
+    /** 当前持锁执行的开始时刻，供看门狗判定是否卡死。 */
+    private static volatile long unlockStartedAt;
+    /** 看门狗阈值：单次解锁（含 TEE 校验）超过此时长即认为卡死并强制释放锁。 */
+    private static final long UNLOCK_WATCHDOG_MS = 10_000L;
+
+    /** 统一的「取锁 → 执行 → 放锁」封装，避免各处重复且遗漏看门狗。 */
+    private static void runUnlockGuarded(Object mediator, String from,
+                                         boolean requireLocked, int generation) {
+        if (!unlockRunning.compareAndSet(false, true)) {
+            log(Log.DEBUG, from + ": unlock already in flight, skip", null);
+            return;
+        }
+        final long startedAt = SystemClock.uptimeMillis();
+        unlockStartedAt = startedAt;
+        armUnlockWatchdog(startedAt);
+        try {
+            tryUnlock(mediator, from, requireLocked, generation);
+        } catch (Throwable t) {
+            log(Log.ERROR, "unlock(" + from + ") failed", t);
+        } finally {
+            unlockRunning.set(false);
+        }
+    }
 
     private MirrorAutoUnlockHook() {
     }
@@ -100,6 +161,7 @@ public final class MirrorAutoUnlockHook {
 
             hooked = true;
             log(Log.INFO, "Auto-unlock hook ready, showKeyguard hooked x" + count);
+            prewarmReflection();
             startDisplayWatch();
         } catch (Throwable t) {
             scheduleRetry(loader, attempt, t);
@@ -148,6 +210,9 @@ public final class MirrorAutoUnlockHook {
 
     /** 热重载时按 hook ID 取回拦截器。 */
     public static XposedInterface.Hooker hookerFor(String hookId) {
+        // 热重载走本方法替换 Hook，不会重新执行 install()，
+        // 因此预热也必须挂在这里，否则热重载后首次解锁又回到冷态。
+        prewarmReflection();
         return MirrorAutoUnlockHook::onShowKeyguard;
     }
 
@@ -160,6 +225,11 @@ public final class MirrorAutoUnlockHook {
         preferences = null;
         xposed = null;
         classLoader = null;
+        // 作废进行中的轮询会话：自增 generation 使旧循环在下一轮判断时自行退出
+        pollGeneration++;
+        unlockDone.set(false);
+        unlockRunning.set(false);
+        prewarmed.set(false);
     }
 
     // ==================================================================
@@ -172,9 +242,16 @@ public final class MirrorAutoUnlockHook {
             Object instance = chain.getThisObject();
             if (instance != null) {
                 keyguardMediator = instance;   // 顺手缓存，供路径 B 使用
+                if (!isShowKeyguardPathEnabled()) {
+                    // 路径 A 独立开关默认关闭：投屏中手动锁屏不应被立即解掉
+                    log(Log.DEBUG, "showKeyguard: path A disabled by switch, skip", null);
+                    return result;
+                }
                 long now = System.currentTimeMillis();
                 if (now - lastTriggerAt >= TRIGGER_THROTTLE_MS) {
                     lastTriggerAt = now;
+                    // 路径 A 是单次触发，非轮询；结算完成标志以便与路径 B 互斥
+                    unlockDone.set(false);
                     startUnlockThread(instance, "showKeyguard", false);
                 }
             }
@@ -225,10 +302,8 @@ public final class MirrorAutoUnlockHook {
                     String name = display == null ? null : display.getName();
                     log(Log.INFO, "onDisplayAdded #" + displayId + " name=" + name, null);
                     if (name != null && name.startsWith(MIRROR_DISPLAY_PREFIX)) {
-                        // 多段延迟：虚拟显示刚建立时 keyguard 可能还没到，一次会扑空
-                        scheduleUnlock("display-added", 500L);
-                        scheduleUnlock("display-added", 1500L);
-                        scheduleUnlock("display-added", 3000L);
+                        // 新一次投屏会话：重置完成标志，开启密集轮询
+                        startUnlockPoll("display-added");
                     }
                 }
 
@@ -250,16 +325,85 @@ public final class MirrorAutoUnlockHook {
         }
     }
 
-    private static void scheduleUnlock(final String from, long delayMs) {
-        new Handler(Looper.getMainLooper()).postDelayed(() -> {
-            Object mediator = keyguardMediator != null ? keyguardMediator : findKeyguardMediatorInstance();
-            if (mediator == null) {
-                log(Log.DEBUG, from + ": KeyguardViewMediator not found yet, skip", null);
-                return;
+    // ==================================================================
+    // 路径 B 轮询
+    // ==================================================================
+
+    /**
+     * 开启一次轮询会话。
+     *
+     * <p><b>必须串行</b>：整个会话只在**一条**后台线程里跑，循环体内「检查 → 必要时解锁 →
+     * 睡一个间隔 → 再检查」。绝不允许用 {@code Handler.postDelayed} 定时续投 ——
+     * 那样会在上一次 {@code checkCredential}（耗时 0.9~2.2s）尚未返回时又起一条新线程，
+     * 150ms 的间隔会导致线程数在数十毫秒内爆炸（实测 15ms 内起 21 条），把 SystemUI 拖死。</p>
+     *
+     * <p>每次调用自增 {@link #pollGeneration}，使上一次会话的循环在下一轮判断时自行退出。</p>
+     */
+    private static void startUnlockPoll(String from) {
+        final int generation = ++pollGeneration;
+        final long interval = readPollInterval();
+        unlockDone.set(false);
+        final long deadline = SystemClock.uptimeMillis() + POLL_TIMEOUT_MS;
+        log(Log.INFO, from + ": poll started, interval=" + interval + "ms, timeout="
+                + POLL_TIMEOUT_MS + "ms", null);
+
+        Thread thread = new Thread(() -> {
+            int ticks = 0;
+            while (true) {
+                if (generation != pollGeneration) {
+                    log(Log.INFO, from + ": poll stopped (superseded) after " + ticks + " ticks", null);
+                    return;
+                }
+                if (unlockDone.get()) {
+                    log(Log.INFO, from + ": poll stopped (unlock done) after " + ticks + " ticks", null);
+                    return;
+                }
+                if (SystemClock.uptimeMillis() > deadline) {
+                    log(Log.INFO, from + ": poll stopped (timeout) after " + ticks + " ticks", null);
+                    return;
+                }
+
+                ticks++;
+                Object mediator = keyguardMediator != null
+                        ? keyguardMediator : findKeyguardMediatorInstance();
+                if (mediator != null) {
+                    keyguardMediator = mediator;
+                    // 与路径 A 共用同一把执行锁，保证全模块同一时刻只有一条解锁线程
+                    runUnlockGuarded(mediator, from, true, generation);
+                }
+
+                try {
+                    Thread.sleep(interval);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    log(Log.INFO, from + ": poll interrupted", null);
+                    return;
+                }
             }
-            keyguardMediator = mediator;
-            startUnlockThread(mediator, from, true);
-        }, delayMs);
+        }, "backtap-unlock-poll");
+        thread.setDaemon(true);
+        thread.start();
+    }
+
+    /** 读取轮询间隔，做上下限钳制，异常时回退默认值。 */
+    private static long readPollInterval() {
+        int fallback = Config.DEFAULT_UNLOCK_POLL_INTERVAL_MS;
+        try {
+            SharedPreferences prefs = ensurePreferences();
+            if (prefs != null) {
+                int value = prefs.getInt(Config.PREF_MIRROR_UNLOCK_POLL_INTERVAL, fallback);
+                if (value < Config.MIN_UNLOCK_POLL_INTERVAL_MS) {
+                    return Config.MIN_UNLOCK_POLL_INTERVAL_MS;
+                }
+                if (value > Config.MAX_UNLOCK_POLL_INTERVAL_MS) {
+                    return Config.MAX_UNLOCK_POLL_INTERVAL_MS;
+                }
+                return value;
+            }
+        } catch (Throwable t) {
+            log(Log.WARN, "readPollInterval failed: " + t, null);
+        }
+        return fallback;
     }
 
     /** 不依赖 showKeyguard 被触发过：从 SystemUIApplicationImpl.mServices 中按类名捞实例。 */
@@ -293,19 +437,33 @@ public final class MirrorAutoUnlockHook {
     // 解锁主流程
     // ==================================================================
 
-    private static void startUnlockThread(final Object mediator, final String from, final boolean requireLocked) {
-        Thread thread = new Thread(() -> {
-            try {
-                tryUnlock(mediator, from, requireLocked);   // checkCredential 不能在主线程
-            } catch (Throwable t) {
-                log(Log.ERROR, "unlock(" + from + ") failed", t);
-            }
-        }, "backtap-mirror-unlock");
+    /**
+     * 起线程执行解锁（路径 A 专用，单次触发）。
+     *
+     * <p>用 CAS 保证同一时刻至多一条解锁线程在跑 —— 路径 A 的 1 秒节流并不能防止
+     * 「上一条线程仍在 TEE 里未返回、下一条已起来」，必须显式互斥。</p>
+     */
+    private static void startUnlockThread(final Object mediator, final String from,
+                                          final boolean requireLocked) {
+        if (unlockDone.get()) {
+            return;
+        }
+        Thread thread = new Thread(() -> runUnlockGuarded(mediator, from, requireLocked,
+                pollGeneration), "backtap-mirror-unlock");
         thread.setDaemon(true);
         thread.start();
     }
 
-    private static void tryUnlock(Object mediator, String from, boolean requireLocked) throws Throwable {
+    private static void tryUnlock(Object mediator, String from, boolean requireLocked)
+            throws Throwable {
+        tryUnlock(mediator, from, requireLocked, pollGeneration);
+    }
+
+    private static void tryUnlock(Object mediator, String from, boolean requireLocked,
+                                  int generation) throws Throwable {
+        if (unlockDone.get()) {
+            return;                                    // 已被其他轮询任务解锁
+        }
         if (!isUnlockEnabled()) {
             log(Log.DEBUG, from + ": auto unlock disabled, skip", null);
             return;
@@ -371,6 +529,13 @@ public final class MirrorAutoUnlockHook {
         if (!matched) {
             return;
         }
+        if (generation != pollGeneration) {
+            log(Log.INFO, from + ": session superseded, discard result", null);
+            return;                                    // 会话已作废，丢弃本次结果
+        }
+
+        // 先置位，让并发的其他轮询任务立刻短路，不再重复支付 TEE 校验成本
+        unlockDone.set(true);
 
         // handleKeyguardDone 碰 View，必须回主线程
         new Handler(Looper.getMainLooper()).post(() -> {
@@ -378,12 +543,40 @@ public final class MirrorAutoUnlockHook {
                 Method done = mediator.getClass().getDeclaredMethod("handleKeyguardDone");
                 done.setAccessible(true);
                 done.invoke(mediator);
-                log(Log.INFO, from + ": handleKeyguardDone OK", null);
+                log(Log.INFO, from + ": handleKeyguardDone OK (poll halted)", null);
                 showUnlockToast(context);
             } catch (Throwable t) {
+                unlockDone.set(false);                 // 收屏失败 → 放开，允许后续重试
                 log(Log.ERROR, "handleKeyguardDone failed", t);
             }
         });
+    }
+
+    /**
+     * 解锁执行的看门狗。
+     *
+     * <p>{@code checkCredential} 是同步的 TEE 调用，无法中断。若它在硬件层卡住，
+     * 持锁线程会永远不释放，后续解锁（含路径 A）将全部被 {@code unlockRunning} 挡掉，
+     * 表现为"自动解锁再也不生效"。本守护线程每隔一段时间检查一次开始时刻，
+     * 超过 {@link #UNLOCK_WATCHDOG_MS} 未完成即强制释放锁并记录告警。</p>
+     */
+    private static void armUnlockWatchdog(final long startedAt) {
+        Thread watchdog = new Thread(() -> {
+            try {
+                Thread.sleep(UNLOCK_WATCHDOG_MS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+            // 若锁仍被同一次执行持有（开始时刻未变），说明它卡住了
+            if (unlockRunning.get() && unlockStartedAt == startedAt) {
+                log(Log.ERROR, "unlock watchdog fired after " + UNLOCK_WATCHDOG_MS
+                        + "ms, force-releasing lock", null);
+                unlockRunning.set(false);
+            }
+        }, "backtap-unlock-watchdog");
+        watchdog.setDaemon(true);
+        watchdog.start();
     }
 
     /**
@@ -473,6 +666,37 @@ public final class MirrorAutoUnlockHook {
         } catch (Throwable first) {
             return Class.forName(name);
         }
+    }
+
+    /**
+     * 反射类预热（方案 C）。
+     *
+     * <p>实测首次解锁耗时 2.16s，而热态仅 0.93s —— 差值主要来自反射类加载与 JIT 预热。
+     * 这里在 hook 就绪时就把用到的类与关键方法解析一遍，把这段成本从「用户等待解锁的时刻」
+     * 前移到「模块加载时刻」，用户侧不再感知。</p>
+     *
+     * <p>失败不影响功能：真正解锁时仍会重新解析。</p>
+     */
+    private static void prewarmReflection() {
+        if (!prewarmed.compareAndSet(false, true)) {
+            return;
+        }
+        Thread thread = new Thread(() -> {
+            long start = SystemClock.uptimeMillis();
+            try {
+                Class<?> credentialClass = loadClass("com.android.internal.widget.LockscreenCredential");
+                credentialClass.getDeclaredMethod("createPin", CharSequence.class).setAccessible(true);
+                credentialClass.getDeclaredMethod("createPassword", CharSequence.class).setAccessible(true);
+                Class<?> cellClass = loadClass("com.android.internal.widget.LockPatternView$Cell");
+                cellClass.getDeclaredMethod("of", int.class, int.class).setAccessible(true);
+                log(Log.INFO, "Reflection prewarmed in "
+                        + (SystemClock.uptimeMillis() - start) + "ms", null);
+            } catch (Throwable t) {
+                log(Log.WARN, "prewarmReflection failed (non-fatal): " + t, null);
+            }
+        }, "backtap-prewarm");
+        thread.setDaemon(true);
+        thread.start();
     }
 
     private static Object buildCredential(String secret, boolean isPattern) throws Throwable {
@@ -610,6 +834,18 @@ public final class MirrorAutoUnlockHook {
     private static boolean isUnlockEnabled() {
         SharedPreferences prefs = ensurePreferences();
         return prefs != null && prefs.getBoolean(Config.PREF_MIRROR_UNLOCK_ENABLED, false);
+    }
+
+    /**
+     * 路径 A（showKeyguard）独立开关，默认关闭。
+     *
+     * <p>该路径对应「投屏在先 → 之后锁屏」：用户在投屏中手动锁屏时会立刻触发解锁，
+     * 表现为"锁不上"。默认关闭后，只有路径 B（已锁屏 → 之后连投屏）在总开关开启时生效。</p>
+     */
+    private static boolean isShowKeyguardPathEnabled() {
+        SharedPreferences prefs = ensurePreferences();
+        return prefs != null
+                && prefs.getBoolean(Config.PREF_MIRROR_UNLOCK_SHOWKEYGUARD_ENABLED, false);
     }
 
     private static SharedPreferences ensurePreferences() {

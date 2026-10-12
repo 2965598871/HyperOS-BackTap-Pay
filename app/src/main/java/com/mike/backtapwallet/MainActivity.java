@@ -23,6 +23,7 @@ import android.widget.LinearLayout;
 import android.widget.RadioButton;
 import android.widget.RadioGroup;
 import android.widget.ScrollView;
+import android.widget.SeekBar;
 import android.widget.Switch;
 import android.widget.TextView;
 import android.widget.Toast;
@@ -66,6 +67,7 @@ public final class MainActivity extends Activity implements ModuleApp.ServiceSta
     private Switch tipsSwitch;
     private Switch imeFixSwitch;
     private Switch unlockSwitch;
+    private Switch unlockShowKeyguardSwitch;
 
     private TextView imeFixStateText;
 
@@ -73,6 +75,8 @@ public final class MainActivity extends Activity implements ModuleApp.ServiceSta
     private RadioGroup unlockTypeGroup;
     private EditText unlockSecretInput;
     private TextView saveUnlockButton;
+    private SeekBar pollSeekBar;
+    private TextView pollValueText;
     private int unlockPatternId;
     private int unlockPinId;
     private int unlockPasswordId;
@@ -423,11 +427,123 @@ public final class MainActivity extends Activity implements ModuleApp.ServiceSta
         LinearLayout container = new LinearLayout(this);
         container.setOrientation(LinearLayout.VERTICAL);
 
+        // 路径 A 独立开关：投屏在先 → 之后锁屏。默认关闭，避免投屏中手动锁屏被立即解掉。
+        LinearLayout pathARow = new LinearLayout(this);
+        pathARow.setOrientation(LinearLayout.HORIZONTAL);
+        pathARow.setGravity(Gravity.CENTER_VERTICAL);
+        TextView pathALabel = text("锁屏时也自动解锁（路径 A）", 14, COLOR_TEXT, false);
+        pathALabel.setLayoutParams(new LinearLayout.LayoutParams(
+                0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+        pathARow.addView(pathALabel);
+        unlockShowKeyguardSwitch = cardSwitch();
+        pathARow.addView(unlockShowKeyguardSwitch);
+        LinearLayout.LayoutParams pathARowLp = matchWrap();
+        pathARowLp.topMargin = dp(4);
+        container.addView(pathARow, pathARowLp);
+
+        TextView pathADesc = text(
+                "默认关闭：投屏中手动锁屏会保持锁定。开启后（投屏在先 → 之后锁屏）锁上会被立即解掉。"
+                        + "「先锁屏 → 后连投屏」的自动解锁不受此开关影响。",
+                12,
+                COLOR_SUBTEXT,
+                false
+        );
+        LinearLayout.LayoutParams pathADescLp = wrap();
+        pathADescLp.topMargin = dp(3);
+        container.addView(pathADesc, pathADescLp);
+
+        unlockShowKeyguardSwitch.setOnCheckedChangeListener((buttonView, isChecked) -> {
+            if (loadingUi) {
+                return;
+            }
+            if (!requireModernService()) {
+                refreshMirrorCards();
+                return;
+            }
+            boolean ok = preferences.edit()
+                    .putBoolean(Config.PREF_MIRROR_UNLOCK_SHOWKEYGUARD_ENABLED, isChecked)
+                    .commit();
+            if (ok) {
+                toast(isChecked
+                        ? "路径 A 已开启：投屏中锁屏会被自动解掉"
+                        : "路径 A 已关闭：投屏中锁屏保持锁定");
+            } else {
+                toast("保存失败");
+                refreshMirrorCards();
+            }
+        });
+
+        // 检测间隔：路径 B 轮询 keyguard 的周期。越小解锁越快，但唤醒次数略增。
+        LinearLayout pollRow = new LinearLayout(this);
+        pollRow.setOrientation(LinearLayout.HORIZONTAL);
+        pollRow.setGravity(Gravity.CENTER_VERTICAL);
+        TextView pollLabel = text("检测间隔", 14, COLOR_TEXT, false);
+        pollLabel.setLayoutParams(new LinearLayout.LayoutParams(
+                0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+        pollRow.addView(pollLabel);
+        pollValueText = text("", 13, COLOR_SUBTEXT, false);
+        pollRow.addView(pollValueText);
+        LinearLayout.LayoutParams pollRowLp = matchWrap();
+        pollRowLp.topMargin = dp(12);
+        container.addView(pollRow, pollRowLp);
+
+        pollSeekBar = new SeekBar(this);
+        pollSeekBar.setMax(Config.MAX_UNLOCK_POLL_INTERVAL_MS
+                - Config.MIN_UNLOCK_POLL_INTERVAL_MS);
+        pollSeekBar.setProgress(Config.DEFAULT_UNLOCK_POLL_INTERVAL_MS
+                - Config.MIN_UNLOCK_POLL_INTERVAL_MS);
+        LinearLayout.LayoutParams pollBarLp = matchWrap();
+        pollBarLp.topMargin = dp(2);
+        container.addView(pollSeekBar, pollBarLp);
+
+        TextView pollDesc = text(
+                "投屏建立后按此间隔轮询锁屏状态：一旦检测到已锁屏立即解锁，成功后立刻停止检测。"
+                        + "默认 150ms，越小解锁越快，资源占用可忽略。",
+                12,
+                COLOR_SUBTEXT,
+                false
+        );
+        LinearLayout.LayoutParams pollDescLp = wrap();
+        pollDescLp.topMargin = dp(3);
+        container.addView(pollDesc, pollDescLp);
+
+        pollSeekBar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override
+            public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
+                int value = Config.MIN_UNLOCK_POLL_INTERVAL_MS + progress;
+                if (pollValueText != null) {
+                    pollValueText.setText(value + " ms");
+                }
+            }
+
+            @Override
+            public void onStartTrackingTouch(SeekBar seekBar) {
+            }
+
+            @Override
+            public void onStopTrackingTouch(SeekBar seekBar) {
+                if (loadingUi) {
+                    return;
+                }
+                int value = Config.MIN_UNLOCK_POLL_INTERVAL_MS + seekBar.getProgress();
+                if (!requireModernService()) {
+                    refreshMirrorCards();
+                    return;
+                }
+                boolean ok = preferences.edit()
+                        .putInt(Config.PREF_MIRROR_UNLOCK_POLL_INTERVAL, value)
+                        .commit();
+                toast(ok ? "检测间隔已设为 " + value + " ms" : "保存失败");
+                if (!ok) {
+                    refreshMirrorCards();
+                }
+            }
+        });
+
         TextView typeLabel = text("凭据类型", 13, COLOR_SUBTEXT, false);
         LinearLayout.LayoutParams typeLabelLp = wrap();
         typeLabelLp.topMargin = dp(14);
         container.addView(typeLabel, typeLabelLp);
-
         unlockTypeGroup = new RadioGroup(this);
         unlockTypeGroup.setOrientation(LinearLayout.HORIZONTAL);
         unlockPatternId = View.generateViewId();
@@ -797,11 +913,33 @@ public final class MainActivity extends Activity implements ModuleApp.ServiceSta
                 unlockConfigContainer.setVisibility(unlockEnabled ? View.VISIBLE : View.GONE);
             }
 
+            if (unlockShowKeyguardSwitch != null) {
+                unlockShowKeyguardSwitch.setChecked(preferences.getBoolean(
+                        Config.PREF_MIRROR_UNLOCK_SHOWKEYGUARD_ENABLED, false));
+                unlockShowKeyguardSwitch.setEnabled(serviceReady && unlockEnabled);
+                unlockShowKeyguardSwitch.setAlpha(serviceReady && unlockEnabled ? 1.0f : 0.5f);
+            }
+
             if (unlockTypeGroup != null) {
                 String type = preferences.getString(
                         Config.PREF_MIRROR_UNLOCK_TYPE, Config.UNLOCK_TYPE_PATTERN);
                 unlockTypeGroup.check(idForUnlockType(type));
                 setActionGroupEnabled(unlockTypeGroup, serviceReady && unlockEnabled);
+            }
+            if (pollSeekBar != null) {
+                int interval = preferences.getInt(Config.PREF_MIRROR_UNLOCK_POLL_INTERVAL,
+                        Config.DEFAULT_UNLOCK_POLL_INTERVAL_MS);
+                if (interval < Config.MIN_UNLOCK_POLL_INTERVAL_MS) {
+                    interval = Config.MIN_UNLOCK_POLL_INTERVAL_MS;
+                }
+                if (interval > Config.MAX_UNLOCK_POLL_INTERVAL_MS) {
+                    interval = Config.MAX_UNLOCK_POLL_INTERVAL_MS;
+                }
+                pollSeekBar.setProgress(interval - Config.MIN_UNLOCK_POLL_INTERVAL_MS);
+                if (pollValueText != null) {
+                    pollValueText.setText(interval + " ms");
+                }
+                pollSeekBar.setEnabled(serviceReady && unlockEnabled);
             }
             if (unlockSecretInput != null) {
                 String secret = preferences.getString(Config.PREF_MIRROR_UNLOCK_SECRET, "");

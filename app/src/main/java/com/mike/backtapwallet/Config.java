@@ -15,6 +15,30 @@ public final class Config {
     // ---- 投屏自动解锁 ----
     /** 开关，默认关闭 */
     public static final String PREF_MIRROR_UNLOCK_ENABLED = "mirror_unlock_enabled";
+    /**
+     * 路径 A（{@code KeyguardViewMediator#showKeyguard}：投屏在先 → 之后锁屏）独立开关。
+     *
+     * <p>默认关闭：该路径会在投屏中**手动锁屏的瞬间**把锁解掉，导致用户"锁不上"。
+     * 路径 B（锁屏在先 → 之后连投屏，{@code onDisplayAdded}）不受此开关影响，
+     * 仍由 {@link #PREF_MIRROR_UNLOCK_ENABLED} 单独控制。</p>
+     */
+    public static final String PREF_MIRROR_UNLOCK_SHOWKEYGUARD_ENABLED =
+            "mirror_unlock_showkeyguard_enabled";
+    /**
+     * 路径 B 的解锁尝试间隔（毫秒）。
+     *
+     * <p>投屏建立时手机往往尚未锁屏，keyguard 何时锁上无法预知。早期实现用
+     * 0.5s / 1.5s / 3.0s 三个固定档位，命中时机纯靠运气 —— 实测最坏要等到第 3 档，
+     * 白等 3.1s。现改为按本间隔密集轮询，命中即解并立刻停表。</p>
+     */
+    public static final String PREF_MIRROR_UNLOCK_POLL_INTERVAL = "mirror_unlock_poll_interval";
+    /** 轮询间隔默认值（毫秒）。150ms 对应最坏额外等待 0.15s。 */
+    public static final int DEFAULT_UNLOCK_POLL_INTERVAL_MS = 150;
+    /** 轮询间隔下限，防止配置过密。 */
+    public static final int MIN_UNLOCK_POLL_INTERVAL_MS = 80;
+    /** 轮询间隔上限，防止配置过疏导致体感迟钝。 */
+    public static final int MAX_UNLOCK_POLL_INTERVAL_MS = 2000;
+
     /** 凭据类型：pattern / pin / password */
     public static final String PREF_MIRROR_UNLOCK_TYPE = "mirror_unlock_type";
     /** 凭据内容；图案为九宫格编号串（左上=1），如 "4756" */
